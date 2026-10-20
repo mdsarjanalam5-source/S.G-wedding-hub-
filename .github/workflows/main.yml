@@ -28,13 +28,7 @@ jobs:
         shell: bash
         run: |
           ZIP="SG_Wedding_Hub_Firebase_Android_Studio.zip"
-
-          if [ ! -f "$ZIP" ]; then
-            echo "Missing $ZIP in repository root"
-            ls -la
-            exit 1
-          fi
-
+          test -f "$ZIP" || { echo "ZIP not found"; exit 1; }
           mkdir -p extracted
           unzip -o "$ZIP" -d extracted
 
@@ -42,90 +36,87 @@ jobs:
             \( -name settings.gradle.kts -o -name settings.gradle \) \
             | head -n 1)
 
-          if [ -z "$SETTINGS" ]; then
-            echo "Gradle settings file not found"
-            find extracted -maxdepth 5 -type f
-            exit 1
-          fi
+          test -n "$SETTINGS" || { echo "Gradle settings not found"; exit 1; }
 
           ROOT=$(dirname "$SETTINGS")
-
-          if [ ! -f "$ROOT/app/build.gradle.kts" ] && \
-             [ ! -f "$ROOT/app/build.gradle" ]; then
-            echo "App Gradle file not found"
-            find "$ROOT" -maxdepth 4 -type f
-            exit 1
-          fi
-
           echo "BUILD_ROOT=$ROOT" >> "$GITHUB_ENV"
 
-      - name: Set up Gradle
-        uses: gradle/actions/setup-gradle@v4
-        with:
-          gradle-version: '8.11.1'
-
-      - name: Fix Java and Kotlin JVM targets
+      - name: Fix Java and Kotlin targets
         shell: bash
         run: |
-          FILE="$BUILD_ROOT/app/build.gradle.kts"
-
-          if [ -f "$FILE" ]; then
-            python3 - "$FILE" <<'PY'
-          import re, sys
+          python3 - "$BUILD_ROOT/app/build.gradle.kts" <<'PY'
+          import re
+          import sys
           from pathlib import Path
 
           p = Path(sys.argv[1])
           s = p.read_text()
 
-          if re.search(r'compileOptions\s*\{', s):
-              s = re.sub(
-                  r'(sourceCompatibility\s*=\s*)JavaVersion\.VERSION_1_8',
-                  r'\1JavaVersion.VERSION_17', s)
-              s = re.sub(
-                  r'(targetCompatibility\s*=\s*)JavaVersion\.VERSION_1_8',
-                  r'\1JavaVersion.VERSION_17', s)
-              s = re.sub(
-                  r'(sourceCompatibility\s*=\s*)JavaVersion\.toVersion\(["\']1\.8["\']\)',
-                  r'\1JavaVersion.VERSION_17', s)
-              s = re.sub(
-                  r'(targetCompatibility\s*=\s*)JavaVersion\.toVersion\(["\']1\.8["\']\)',
-                  r'\1JavaVersion.VERSION_17', s)
-          else:
-              block = '''
-              compileOptions {
-                  sourceCompatibility = JavaVersion.VERSION_17
-                  targetCompatibility = JavaVersion.VERSION_17
-              }
-              '''
-              s = re.sub(r'android\s*\{', lambda m: m.group(0) + block, s, count=1)
+          # Remove the invalid block added by the previous workflow.
+          s = re.sub(
+              r'\ntasks\.withType\(org\.jetbrains\.kotlin\.gradle\.tasks\.KotlinCompile\)'
+              r'\.configureEach\s*\{.*?^\s*\}\s*(?=\s*$)',
+              '\n',
+              s,
+              flags=re.S | re.M
+          )
 
+          # Replace Java 8 targets with Java 17.
+          s = re.sub(r'JavaVersion\.VERSION_1_8',
+                     'JavaVersion.VERSION_17', s)
+          s = re.sub(r'JavaVersion\.VERSION_1_8',
+                     'JavaVersion.VERSION_17', s)
           s = re.sub(r'jvmTarget\s*=\s*["\']1\.8["\']',
                      'jvmTarget = "17"', s)
 
-          if 'kotlinOptions {' in s:
-              if 'jvmTarget' not in s:
-                  s = s.replace('kotlinOptions {',
-                                'kotlinOptions {\n        jvmTarget = "17"', 1)
-          elif 'compilerOptions {' not in s and 'org.jetbrains.kotlin' in s:
-              s += '''
+          # Ensure Java compile options are inside android { }.
+          if 'compileOptions {' not in s:
+              s = re.sub(
+                  r'android\s*\{',
+                  lambda m: m.group(0) +
+                  '\n    compileOptions {\n'
+                  '        sourceCompatibility = JavaVersion.VERSION_17\n'
+                  '        targetCompatibility = JavaVersion.VERSION_17\n'
+                  '    }\n',
+                  s,
+                  count=1
+              )
 
-          tasks.withType(org.jetbrains.kotlin.gradle.tasks.KotlinCompile).configureEach {
-              kotlinOptions {
-                  jvmTarget = "17"
-              }
-          }
-          '''
+          # Ensure Kotlin JVM target is configured inside android { }.
+          if 'kotlinOptions {' not in s:
+              match = re.search(r'android\s*\{', s)
+              if not match:
+                  raise SystemExit('android { } block not found')
+              start = match.end()
+              depth = 1
+              i = start
+              while i < len(s) and depth:
+                  if s[i] == '{':
+                      depth += 1
+                  elif s[i] == '}':
+                      depth -= 1
+                  i += 1
+              if depth:
+                  raise SystemExit('Unclosed android { } block')
+              s = s[:i-1] + '\n    kotlinOptions {\n' \
+                  '        jvmTarget = "17"\n' \
+                  '    }\n' + s[i-1:]
 
           p.write_text(s)
-          print("Updated JVM target settings in", p)
+          print('Updated:', p)
+          print('Reviewing target settings:')
+          for line in s.splitlines():
+              if any(k in line for k in (
+                  'sourceCompatibility', 'targetCompatibility',
+                  'jvmTarget', 'tasks.withType'
+              )):
+                  print(line.strip())
           PY
-          else
-            FILE="$BUILD_ROOT/app/build.gradle"
-            echo "Groovy Gradle file detected: $FILE"
-            grep -nE 'sourceCompatibility|targetCompatibility|jvmTarget|kotlinOptions' "$FILE" || true
-            echo "Please check Groovy Gradle target settings."
-            exit 1
-          fi
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.11.1'
 
       - name: Build Debug APK
         run: gradle -p "$BUILD_ROOT" assembleDebug
